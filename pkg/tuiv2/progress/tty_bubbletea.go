@@ -10,12 +10,21 @@ import (
 	"golang.org/x/term"
 )
 
-// ttyDirtyMsg tells the Bubble Tea program that the progress state has changed and
-// it should re-render the Active area.
-type ttyDirtyMsg struct{}
+type ttyEventMsg struct {
+	Event Event
+	Ack   chan ttyEventAck
+}
+
+type ttyShutdownMsg struct{}
+
+type ttyEventAck struct {
+	Prints []string
+}
 
 type ttyModel struct {
-	ui *UI
+	ui     *UI
+	state  *engineState
+	styles ttyStyles
 
 	width  int
 	height int
@@ -25,20 +34,21 @@ type ttyModel struct {
 }
 
 func newTTYModel(ui *UI) ttyModel {
-	m := ttyModel{ui: ui}
+	m := ttyModel{
+		ui:    ui,
+		state: newEngineState(),
+	}
 	if ui != nil {
+		m.styles = newTTYStyles(ui.out)
 		m.spinner = spinner.New(
 			spinner.WithSpinner(spinner.MiniDot),
-			spinner.WithStyle(ui.ttyStyles.spinner),
+			spinner.WithStyle(m.styles.spinner),
 		)
 	}
 	return m
 }
 
 func (m ttyModel) Init() tea.Cmd {
-	// Keep the terminal cursor visible. Bubble Tea hides it by default, which is
-	// common for fullscreen TUIs but undesirable for an inline progress display:
-	// if the program crashes, the terminal can be left in a "cursor hidden" state.
 	return tea.ShowCursor
 }
 
@@ -48,38 +58,103 @@ func (m ttyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
-	case ttyDirtyMsg:
-		if m.ui != nil {
-			m.ui.mu.Lock()
-			hasRunning := m.ui.hasRunningLocked()
-			m.ui.mu.Unlock()
-			if hasRunning {
-				if !m.spinnerActive {
-					m.spinnerActive = true
-					return m, func() tea.Msg { return m.spinner.Tick() }
+	case ttyShutdownMsg:
+		return m, tea.Quit
+	case ttyEventMsg:
+		ui := m.ui
+		prints := []string(nil)
+		if msg.Ack != nil {
+			defer func() {
+				msg.Ack <- ttyEventAck{Prints: prints}
+			}()
+		}
+		if ui == nil {
+			return m, nil
+		}
+		e := msg.Event
+		now := e.At
+		if now.IsZero() && ui.now != nil {
+			now = ui.now()
+		}
+
+		if ui.eventLog != nil && e.Type != EventSync {
+			ui.eventLog.write(now, e)
+		}
+
+		if e.Type == EventSync {
+			ui.fulfillSync(e.SyncID)
+			return m, m.ensureSpinnerTick()
+		}
+
+		// PrintLines is a pure output event: it does not affect progress state.
+		switch e.Type {
+		case EventPrintLines:
+			if len(e.Lines) == 0 {
+				return m, m.ensureSpinnerTick()
+			}
+			lines := make([]string, 0, len(e.Lines))
+			for _, line := range e.Lines {
+				if line == "" {
+					lines = append(lines, "\r"+ansi.EraseLineRight)
+					continue
 				}
-				return m, nil
+				lines = append(lines, "\r"+line+ansi.EraseLineRight)
+			}
+			prints = append(prints, strings.Join(lines, "\n"))
+			return m, m.ensureSpinnerTick()
+		default:
+		}
+
+		m.state.applyEvent(now, e)
+
+		// Seal snapshots (explicit).
+		if e.Type == EventGroupClose && e.Finished != nil && !*e.Finished {
+			if g := m.state.groupByID[e.GroupID]; g != nil && g.sealed {
+				if lines := m.snapshotLines(g, true); len(lines) > 0 {
+					prints = append(prints, "\r"+strings.Join(lines, "\n"))
+				}
 			}
 		}
-		m.spinnerActive = false
-		return m, nil
+
+		// Seal finished groups (auto).
+		for _, g := range m.state.groups {
+			if g == nil || !g.canAutoSeal() {
+				continue
+			}
+			g.sealed = true
+			if lines := m.snapshotLines(g, false); len(lines) > 0 {
+				prints = append(prints, "\r"+strings.Join(lines, "\n"))
+			}
+		}
+
+		return m, m.ensureSpinnerTick()
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		if m.ui != nil {
-			m.ui.mu.Lock()
-			hasRunning := m.ui.hasRunningLocked()
-			m.ui.mu.Unlock()
-			if hasRunning {
-				m.spinnerActive = true
-				return m, cmd
-			}
+		if m.state != nil && m.state.hasRunning() {
+			m.spinnerActive = true
+			return m, cmd
 		}
 		m.spinnerActive = false
 		return m, nil
 	default:
 		return m, nil
 	}
+}
+
+func (m *ttyModel) ensureSpinnerTick() tea.Cmd {
+	if m == nil || m.state == nil {
+		return nil
+	}
+	if !m.state.hasRunning() {
+		m.spinnerActive = false
+		return nil
+	}
+	if m.spinnerActive {
+		return nil
+	}
+	m.spinnerActive = true
+	return func() tea.Msg { return m.spinner.Tick() }
 }
 
 func (m ttyModel) View() string {
@@ -90,8 +165,8 @@ func (m ttyModel) View() string {
 
 	width := m.width
 	height := m.height
-	if (width <= 0 || height <= 0) && ui.out != nil && term.IsTerminal(int(ui.out.Fd())) {
-		if w, h, err := term.GetSize(int(ui.out.Fd())); err == nil {
+	if (width <= 0 || height <= 0) && ui.outFile != nil && term.IsTerminal(int(ui.outFile.Fd())) {
+		if w, h, err := term.GetSize(int(ui.outFile.Fd())); err == nil {
 			if width <= 0 && w > 0 {
 				width = w
 			}
@@ -112,38 +187,30 @@ func (m ttyModel) View() string {
 		maxLines = 3
 	}
 
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-
 	ctx := ttyRenderContext{
-		styles:  ui.ttyStyles,
+		styles:  m.styles,
 		width:   width,
 		height:  height,
 		spinner: m.spinner.View(),
+		now:     ui.now(),
 	}
 
 	activeLimit := 1_000_000
-
-	blocks := renderTTYBlocksLocked(ui.groups, ctx, activeLimit)
+	blocks := renderTTYBlocks(m.state, ctx, activeLimit)
 	lines := flattenBlocks(blocks)
 	if len(lines) == 0 {
-		// Bubble Tea replaces an empty string view with a literal space to
-		// "render nothing". That space shows up as a confusing blank line at the
-		// beginning of the output in some shells. Render a no-op ANSI reset
-		// sequence instead so the active area can still be cleared without
-		// printing visible characters.
 		return "\r" + ansi.ResetStyle
 	}
+
 	for len(lines)+1 > maxLines && activeLimit > 1 {
 		activeLimit /= 2
 		if activeLimit < 1 {
 			activeLimit = 1
 		}
-		blocks = renderTTYBlocksLocked(ui.groups, ctx, activeLimit)
+		blocks = renderTTYBlocks(m.state, ctx, activeLimit)
 		lines = flattenBlocks(blocks)
 	}
 
-	// Still too long: drop oldest groups (keep the latest ones).
 	if len(lines)+1 > maxLines && len(blocks) > 0 {
 		dropped := 0
 		for len(lines)+1 > maxLines && len(blocks) > 1 {
@@ -157,76 +224,106 @@ func (m ttyModel) View() string {
 		}
 	}
 
-	// Reserve one last empty line for the cursor.
 	lines = append(lines, "")
-
 	if maxLines > 0 && len(lines) > maxLines {
-		// Best-effort fallback: keep the newest lines to avoid terminal scrolling.
 		lines = lines[len(lines)-maxLines:]
 	}
 
-	// Always start at the beginning of the line.
-	//
-	// Some terminals echo "^C" on SIGINT, which moves the cursor forward by two
-	// columns. If we don't reset, Bubble Tea will redraw the active area shifted
-	// to the right, leaving remnants like a leading "• ".
 	return "\r" + strings.Join(lines, "\n")
 }
 
+func (m ttyModel) snapshotLines(g *groupState, freezeSpinner bool) []string {
+	if g == nil || m.ui == nil {
+		return nil
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+		if m.ui.outFile != nil && term.IsTerminal(int(m.ui.outFile.Fd())) {
+			if w, _, err := term.GetSize(int(m.ui.outFile.Fd())); err == nil && w > 0 {
+				width = w
+			}
+		}
+	}
+	sp := ""
+	if freezeSpinner {
+		sp = m.styles.spinner.Render("⠦")
+	}
+	ctx := ttyRenderContext{
+		styles:  m.styles,
+		width:   width,
+		spinner: sp,
+		now:     m.ui.now(),
+	}
+	return ttyGroupComponent{group: g}.Lines(ctx, 1_000_000)
+}
+
 func (ui *UI) startTTY() {
-	if ui == nil || ui.out == nil || ui.ttySendCh == nil || ui.ttyDoneCh == nil {
+	if ui == nil || ui.out == nil {
+		close(ui.doneCh)
 		return
 	}
 
 	model := newTTYModel(ui)
 	p := tea.NewProgram(
 		model,
-		tea.WithOutput(ui.out),     // default: os.Stdout
-		tea.WithInput(nil),         // do not read stdin or enter raw mode
-		tea.WithoutSignalHandler(), // signals are handled by the main program
-		tea.WithFPS(10),            // cap redraw rate
+		tea.WithOutput(ui.out),
+		tea.WithInput(nil),
+		tea.WithoutSignalHandler(),
+		tea.WithFPS(10),
 	)
 	ui.ttyProgram = p
 
-	// Run Bubble Tea in a goroutine so the caller can keep doing work.
 	go func() {
 		defer close(ui.ttyDoneCh)
 		_, _ = p.Run()
 	}()
 
-	// Forward messages through a buffered channel to avoid blocking callers on
-	// Program.Send before the program loop is ready.
+	sendEvent := func(e Event) bool {
+		ackCh := make(chan ttyEventAck)
+		p.Send(ttyEventMsg{Event: e, Ack: ackCh})
+
+		var ack ttyEventAck
+		select {
+		case ack = <-ackCh:
+		case <-ui.ttyDoneCh:
+			return false
+		}
+
+		for _, block := range ack.Prints {
+			select {
+			case <-ui.ttyDoneCh:
+				return false
+			default:
+			}
+			p.Println(block)
+		}
+		return true
+	}
+
 	go func() {
+		defer close(ui.doneCh)
 		for {
 			select {
-			case msg, ok := <-ui.ttySendCh:
-				if !ok {
-					return
+			case <-ui.closeCh:
+				for {
+					select {
+					case e := <-ui.eventsCh:
+						if !sendEvent(e) {
+							return
+						}
+					default:
+						p.Send(ttyShutdownMsg{})
+						return
+					}
 				}
-				p.Send(msg)
 			case <-ui.ttyDoneCh:
 				return
+			case e := <-ui.eventsCh:
+				if !sendEvent(e) {
+					return
+				}
 			}
 		}
 	}()
-
-	// Force an initial render.
-	select {
-	case ui.ttySendCh <- ttyDirtyMsg{}:
-	default:
-	}
-}
-
-func (ui *UI) hasRunningLocked() bool {
-	for _, g := range ui.groups {
-		if g == nil || g.sealed {
-			continue
-		}
-		for _, t := range g.tasks {
-			if t != nil && t.status == taskStatusRunning {
-				return true
-			}
-		}
-	}
-	return false
 }

@@ -133,6 +133,10 @@ Examples:
   $ tiup playground-ng --pd.config ~/config/pd.toml    # Start a local cluster with specified configuration file
   $ tiup playground-ng --db.binpath /xx/tidb-server    # Start a local cluster with component binary path
   $ tiup playground-ng --tag xx                        # Start a local cluster with data dir named 'xx' and uncleaned after exit
+  $ tiup playground-ng -d --tag xx                    # Start a local cluster in background (daemon mode)
+  $ tiup playground-ng stop --tag xx                   # Stop the cluster started with --tag xx
+  $ tiup playground-ng stop-all                        # Stop all running playground-ng instances
+  $ tiup playground-ng ps                              # List all running playground-ng instances
   $ tiup playground-ng --mode tikv-slim                # Start a local tikv only cluster (No TiDB or TiFlash Available)
   $ tiup playground-ng --mode tikv-slim --kv 3 --pd 3  # Start a local tikv only cluster with 6 nodes`,
 		SilenceUsage:  true,
@@ -149,14 +153,31 @@ Examples:
 			}
 
 			isRoot := cmd.Parent() == nil
-			state.deleteWhenExit = false
+			tagExplicit := false
+			if f := cmd.Flags().Lookup("tag"); f != nil {
+				tagExplicit = f.Changed
+			}
+			if !isRoot {
+				dataParent := filepath.Join(tiupHome, localdata.DataParentDir)
+				if shouldIgnoreSubcommandInstanceDataDir(state.tiupDataDir, dataParent) {
+					state.tiupDataDir = ""
+				}
+			}
+			state.destroyDataAfterExit = shouldDestroyDataAfterExit(isRoot, state, tagExplicit, tiupHome)
 
 			// For dry-run, prefer stable default paths so the plan output is
 			// deterministic when users don't specify a tag.
 			if isRoot && state.dryRun && state.tag == "" && state.tiupDataDir == "" {
 				state.tag = "dry-run"
 				state.dataDir = filepath.Join(tiupHome, localdata.DataParentDir, state.tag)
-				state.deleteWhenExit = false
+			} else if isRoot && (state.background || state.runAsDaemon) {
+				// In daemon mode, the data directory must not depend on
+				// TIUP_INSTANCE_DATA_DIR (it may be cleaned by the TiUP runner when the
+				// starter exits).
+				if state.tag == "" {
+					state.tag = utils.Base62Tag()
+				}
+				state.dataDir = filepath.Join(tiupHome, localdata.DataParentDir, state.tag)
 			} else {
 				switch {
 				case state.tag != "":
@@ -168,7 +189,6 @@ Examples:
 					if isRoot {
 						state.tag = utils.Base62Tag()
 						state.dataDir = filepath.Join(tiupHome, localdata.DataParentDir, state.tag)
-						state.deleteWhenExit = true
 					} else {
 						state.dataDir = filepath.Join(tiupHome, localdata.DataParentDir)
 					}
@@ -189,6 +209,10 @@ Examples:
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if state.background && !state.runAsDaemon {
+				return runBackgroundStarter(state)
+			}
+
 			if len(args) > 0 {
 				state.options.Version = args[0]
 			} else if state.options.ShOpt.Mode == proc.ModeNextGen {
@@ -225,20 +249,37 @@ Examples:
 			}
 
 			port := utils.MustGetFreePort("127.0.0.1", 9527, state.options.ShOpt.PortOffset)
-			err := dumpPort(filepath.Join(state.dataDir, "port"), port)
-			p := NewPlayground(state.dataDir, port)
+			releasePID, err := claimPlaygroundPIDFile(state.dataDir, state.tag)
 			if err != nil {
 				return err
 			}
-			p.deleteWhenExit = state.deleteWhenExit
+			defer releasePID()
 
-			ui := progressv2.New(progressv2.Options{Mode: progressv2.ModeAuto, Out: os.Stderr})
+			p := NewPlayground(state.dataDir, port)
+			p.destroyDataAfterExit = state.destroyDataAfterExit
+
+			var eventLog *os.File
+			if state.runAsDaemon {
+				path := filepath.Join(state.dataDir, playgroundTUIEventLogName)
+				f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+				if err != nil {
+					return err
+				}
+				eventLog = f
+				defer func() { _ = f.Close() }()
+			}
+
+			ui := progressv2.New(progressv2.Options{
+				Mode:     progressv2.ModeAuto,
+				Out:      os.Stderr,
+				EventLog: eventLog,
+			})
 			defer ui.Close()
 			p.ui = ui
-			p.downloadGroup = ui.Group("Downloading components")
+			p.downloadGroup = ui.Group("Download components")
 			p.downloadGroup.SetHideDetailsOnSuccess(true)
 			p.downloadGroup.SetSortTasksByTitle(true)
-			p.startingGroup = ui.Group("Starting instances")
+			p.startingGroup = ui.Group("Start instances")
 			downloadGroup := p.downloadGroup
 			restore := attachUIOutput(ui)
 			defer restore()
@@ -311,7 +352,7 @@ Examples:
 					out := p.terminalWriter()
 
 					if p.ui != nil {
-						p.ui.BlankLine()
+						p.ui.PrintLines([]string{""})
 					} else {
 						fmt.Fprintln(out)
 					}
@@ -340,7 +381,10 @@ Examples:
 			return nil
 		},
 		PostRunE: func(cmd *cobra.Command, args []string) error {
-			return environment.GlobalEnv().Close()
+			if env := environment.GlobalEnv(); env != nil {
+				return env.Close()
+			}
+			return nil
 		},
 	}
 
@@ -370,6 +414,9 @@ Examples:
 	rootCmd.Flags().BoolVar(&state.options.ShOpt.ForcePull, "force-pull", false, "Force redownload the component. It is useful to manually refresh nightly or broken binaries")
 	rootCmd.Flags().BoolVar(&state.dryRun, "dry-run", false, "Only generate the boot plan and exit")
 	rootCmd.Flags().StringVar(&state.dryRunOutput, "dry-run-output", "text", "Dry-run output format: text|json")
+	rootCmd.Flags().BoolVarP(&state.background, "background", "d", false, "Start playground-ng in background (daemon mode)")
+	rootCmd.Flags().BoolVar(&state.runAsDaemon, "run-as-daemon", false, "INTERNAL: run as daemon")
+	_ = rootCmd.Flags().MarkHidden("run-as-daemon")
 
 	rootCmd.PersistentFlags().StringVarP(&state.tag, "tag", "T", "", "Specify a tag for playground, data dir of this tag will not be removed after exit")
 	rootCmd.Flags().Bool("without-monitor", false, "Don't start prometheus and grafana component")
@@ -385,6 +432,9 @@ Examples:
 	rootCmd.AddCommand(newDisplay(state))
 	rootCmd.AddCommand(newScaleOut(state))
 	rootCmd.AddCommand(newScaleIn(state))
+	rootCmd.AddCommand(newStop(state))
+	rootCmd.AddCommand(newStopAll(state))
+	rootCmd.AddCommand(newPS(state))
 
 	return rootCmd.Execute()
 }
@@ -443,8 +493,76 @@ func loadPort(dir string) (port int, err error) {
 		return 0, err
 	}
 
-	port, err = strconv.Atoi(string(data))
+	port, err = strconv.Atoi(strings.TrimSpace(string(data)))
 	return
+}
+
+func shouldIgnoreSubcommandInstanceDataDir(instanceDir, dataParentDir string) bool {
+	instanceDir = strings.TrimSpace(instanceDir)
+	dataParentDir = strings.TrimSpace(dataParentDir)
+	if instanceDir == "" || dataParentDir == "" {
+		return false
+	}
+
+	instanceDir = filepath.Clean(instanceDir)
+	dataParentDir = filepath.Clean(dataParentDir)
+
+	// Only ignore paths under the default TiUP data directory to avoid surprising
+	// users who explicitly set TIUP_INSTANCE_DATA_DIR to a custom location.
+	sep := string(os.PathSeparator)
+	if instanceDir == dataParentDir || !strings.HasPrefix(instanceDir, dataParentDir+sep) {
+		return false
+	}
+
+	// When users run subcommands (e.g. `tiup playground-ng display`) without a
+	// global --tag, the TiUP runner generates a temporary tag and sets
+	// TIUP_INSTANCE_DATA_DIR to an empty directory for that invocation. Treat
+	// such directories as non-explicit targets so playground-ng can auto-discover
+	// running instances under $TIUP_HOME/data.
+	tag := filepath.Base(instanceDir)
+	if len(tag) < 7 {
+		return false
+	}
+	for _, r := range tag {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		default:
+			return false
+		}
+	}
+
+	entries, err := os.ReadDir(instanceDir)
+	if err != nil {
+		return false
+	}
+	for _, ent := range entries {
+		name := ent.Name()
+		if name == "" || name == ".DS_Store" {
+			continue
+		}
+		return false
+	}
+
+	return true
+}
+
+func shouldDestroyDataAfterExit(isRoot bool, state *cliState, tagExplicit bool, tiupHome string) bool {
+	if state == nil || !isRoot || state.dryRun || state.background || state.runAsDaemon || tagExplicit {
+		return false
+	}
+	if state.tiupDataDir == "" {
+		return true
+	}
+
+	instanceDir := filepath.Clean(strings.TrimSpace(state.tiupDataDir))
+	dataParent := filepath.Clean(filepath.Join(tiupHome, localdata.DataParentDir))
+	sep := string(os.PathSeparator)
+	return instanceDir != "" &&
+		dataParent != "" &&
+		instanceDir != dataParent &&
+		strings.HasPrefix(instanceDir, dataParent+sep)
 }
 
 func dumpDSN(fname string, dbs []*proc.TiDBInstance, tdbs []*proc.TiProxyInstance) {
@@ -497,11 +615,13 @@ type repoDownloadProgress struct {
 	task *progressv2.Task
 
 	expected map[string]*progressv2.Task
+	byURL    map[string]*progressv2.Task
 
 	now func() time.Time
 
 	lastUpdateAt time.Time
 	lastSize     int64
+	latestSize   int64
 }
 
 func (p *repoDownloadProgress) SetExpectedDownloads(downloads []DownloadPlan) {
@@ -563,20 +683,27 @@ func (p *repoDownloadProgress) Start(rawURL string, size int64) {
 			t.SetMeta(version)
 		}
 	}
+	t.SetMessage("")
 
 	if size > 0 {
 		t.SetTotal(size)
 	}
+	// Set the kind before Start so plain mode prints the download start line
+	// even when the task was pre-created as pending.
 	t.SetKindDownload()
 	t.Start()
-	// Trigger "Downloading ..." start event in plain mode even when the task was
-	// pre-created as pending.
-	t.SetKindDownload()
 
 	p.mu.Lock()
+	if p.byURL == nil {
+		p.byURL = make(map[string]*progressv2.Task)
+	}
+	if rawURL != "" && t != nil {
+		p.byURL[rawURL] = t
+	}
 	p.task = t
 	p.lastUpdateAt = time.Time{}
 	p.lastSize = 0
+	p.latestSize = 0
 	p.mu.Unlock()
 }
 
@@ -589,20 +716,16 @@ func (p *repoDownloadProgress) SetCurrent(size int64) {
 	}
 
 	// Repository download callbacks can be very frequent. Throttle SetCurrent
-	// updates to avoid starving other controller work (like starting TiDB) on the
-	// progress UI mutex.
+	// updates to avoid flooding the progress event channel / renderer.
 	//
-	// This keeps the TTY UI smooth (Bubble Tea already caps redraw FPS) while
-	// reducing lock contention during large downloads.
+	// 10 FPS is enough for a smooth progress UI (TTY redraw is capped anyway) and
+	// also keeps daemon-mode event logs at a reasonable size.
 	now := p.now()
-	const (
-		minInterval = 150 * time.Millisecond
-		minDelta    = 256 * 1024
-	)
+	const minInterval = 100 * time.Millisecond
+
+	p.latestSize = size
 	shouldUpdate := false
 	if size < p.lastSize {
-		shouldUpdate = true
-	} else if size-p.lastSize >= minDelta {
 		shouldUpdate = true
 	} else if p.lastUpdateAt.IsZero() || now.Sub(p.lastUpdateAt) >= minInterval {
 		shouldUpdate = true
@@ -622,6 +745,12 @@ func (p *repoDownloadProgress) SetCurrent(size int64) {
 func (p *repoDownloadProgress) Finish() {
 	p.mu.Lock()
 	t := p.task
+	latestSize := p.latestSize
+	flush := t != nil && latestSize != p.lastSize
+	if flush {
+		p.lastUpdateAt = p.now()
+		p.lastSize = latestSize
+	}
 	p.task = nil
 	ctx := p.ctx
 	p.mu.Unlock()
@@ -629,11 +758,78 @@ func (p *repoDownloadProgress) Finish() {
 	if t == nil {
 		return
 	}
+
+	// Ensure the final progress current is emitted even when the last callback
+	// falls into the throttle window.
+	if flush {
+		t.SetCurrent(latestSize)
+	}
+
 	if ctx != nil && ctx.Err() != nil {
 		t.Cancel("")
 		return
 	}
+}
+
+func (p *repoDownloadProgress) Retry(rawURL string, attempt, maxAttempts int, err error) {
+	if p == nil {
+		return
+	}
+	t := p.taskForURL(rawURL)
+	if t == nil {
+		return
+	}
+	t.Retrying(fmt.Sprintf("retrying %d/%d...", attempt, maxAttempts))
+}
+
+func (p *repoDownloadProgress) Success(rawURL string) {
+	if p == nil {
+		return
+	}
+	t := p.taskForURL(rawURL)
+	if t == nil {
+		return
+	}
+	t.SetMessage("")
 	t.Done()
+}
+
+func (p *repoDownloadProgress) Error(rawURL string, attempt, maxAttempts int, err error) {
+	if p == nil {
+		return
+	}
+	t := p.taskForURL(rawURL)
+	if t == nil {
+		return
+	}
+	if err == nil {
+		t.Error("download failed")
+		return
+	}
+	t.Error(err.Error())
+}
+
+func (p *repoDownloadProgress) taskForURL(rawURL string) *progressv2.Task {
+	if p == nil {
+		return nil
+	}
+
+	base := downloadTitle(rawURL)
+	componentID, resolved, ok := parseComponentVersionFromTarball(base)
+	if ok {
+		key := componentID + "@" + resolved
+		p.mu.Lock()
+		t := p.expected[key]
+		p.mu.Unlock()
+		if t != nil {
+			return t
+		}
+	}
+
+	p.mu.Lock()
+	t := p.byURL[rawURL]
+	p.mu.Unlock()
+	return t
 }
 
 func downloadDisplay(rawURL string) (name, version string) {
@@ -731,6 +927,7 @@ func isKnownGOARCH(goarch string) bool {
 }
 
 var _ repository.DownloadProgress = (*repoDownloadProgress)(nil)
+var _ repository.DownloadProgressReporter = (*repoDownloadProgress)(nil)
 
 func main() {
 	tui.RegisterArg0("tiup playground-ng")
@@ -747,7 +944,7 @@ func main() {
 		}
 		code = 1
 	}
-	if state != nil && state.deleteWhenExit && state.dataDir != "" {
+	if state != nil && state.destroyDataAfterExit && state.tiupDataDir == "" && state.dataDir != "" {
 		_ = os.RemoveAll(state.dataDir)
 	}
 

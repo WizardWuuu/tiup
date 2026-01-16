@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tiup/components/playground-ng/proc"
@@ -579,7 +580,12 @@ func (p *Playground) bootCluster(ctx context.Context, options *BootOptions) (err
 		return ctx.Err()
 	}
 
-	// Conclude "Starting instances" before printing user-facing hints, so the
+	// Ensure "Start instances" tasks reach their terminal states before we close
+	// the progress group and print user-facing hints, otherwise the output blocks
+	// may interleave in daemon/starter mode (extra blank lines, wrong ordering).
+	p.waitBootStartingTasksSettled(time.Second)
+
+	// Conclude "Start instances" before printing user-facing hints, so the
 	// final group output stays in the history area and won't be redrawn.
 	p.closeStartingGroup()
 
@@ -588,7 +594,7 @@ func (p *Playground) bootCluster(ctx context.Context, options *BootOptions) (err
 	}
 
 	if p.ui != nil {
-		p.ui.BlankLine()
+		p.ui.PrintLines([]string{""})
 	} else {
 		fmt.Fprintln(p.terminalWriter())
 	}

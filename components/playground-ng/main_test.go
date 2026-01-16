@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/tiup/pkg/localdata"
 	progressv2 "github.com/pingcap/tiup/pkg/tuiv2/progress"
 	"github.com/stretchr/testify/require"
 )
@@ -70,6 +71,102 @@ func TestGetAbsolutePath(t *testing.T) {
 		want, err := filepath.Abs(filepath.Join(home, "a/b"))
 		require.NoError(t, err)
 		require.Equal(t, want, got)
+	})
+}
+
+func TestLoadPort_TrimsWhitespace(t *testing.T) {
+	base := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(base, "port"), []byte(" 12345 \n"), 0o644))
+
+	port, err := loadPort(base)
+	require.NoError(t, err)
+	require.Equal(t, 12345, port)
+}
+
+func TestShouldIgnoreSubcommandInstanceDataDir(t *testing.T) {
+	base := t.TempDir()
+	dataParent := filepath.Join(base, "data")
+	require.NoError(t, os.MkdirAll(dataParent, 0o755))
+
+	t.Run("EmptyInstanceDir", func(t *testing.T) {
+		require.False(t, shouldIgnoreSubcommandInstanceDataDir("", dataParent))
+	})
+
+	t.Run("OutsideDataParent", func(t *testing.T) {
+		dir := filepath.Join(base, "other", "V8CMwY9")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.False(t, shouldIgnoreSubcommandInstanceDataDir(dir, dataParent))
+	})
+
+	t.Run("NotBase62Tag", func(t *testing.T) {
+		dir := filepath.Join(dataParent, "my-cluster")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.False(t, shouldIgnoreSubcommandInstanceDataDir(dir, dataParent))
+	})
+
+	t.Run("NonEmptyDir", func(t *testing.T) {
+		dir := filepath.Join(dataParent, "V8CMwY8")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "port"), []byte("12345"), 0o644))
+		require.False(t, shouldIgnoreSubcommandInstanceDataDir(dir, dataParent))
+	})
+
+	t.Run("OnlyDSStore", func(t *testing.T) {
+		dir := filepath.Join(dataParent, "V8CMwY9")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".DS_Store"), []byte(""), 0o644))
+		require.True(t, shouldIgnoreSubcommandInstanceDataDir(dir, dataParent))
+	})
+}
+
+func TestShouldDestroyDataAfterExit(t *testing.T) {
+	tiupHome := t.TempDir()
+	dataParent := filepath.Join(tiupHome, localdata.DataParentDir)
+	require.NoError(t, os.MkdirAll(dataParent, 0o755))
+
+	t.Run("RootNoTiupDataDir", func(t *testing.T) {
+		state := &cliState{}
+		require.True(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("RootTiupDataDirUnderDataParent", func(t *testing.T) {
+		state := &cliState{tiupDataDir: filepath.Join(dataParent, "V8CMwY9")}
+		require.True(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("RootTiupDataDirEqualsDataParent", func(t *testing.T) {
+		state := &cliState{tiupDataDir: dataParent}
+		require.False(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("RootTiupDataDirOutsideDataParent", func(t *testing.T) {
+		state := &cliState{tiupDataDir: filepath.Join(tiupHome, "custom", "V8CMwY9")}
+		require.False(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("NotRoot", func(t *testing.T) {
+		state := &cliState{}
+		require.False(t, shouldDestroyDataAfterExit(false, state, false, tiupHome))
+	})
+
+	t.Run("DryRun", func(t *testing.T) {
+		state := &cliState{dryRun: true}
+		require.False(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("Background", func(t *testing.T) {
+		state := &cliState{background: true}
+		require.False(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("RunAsDaemon", func(t *testing.T) {
+		state := &cliState{runAsDaemon: true}
+		require.False(t, shouldDestroyDataAfterExit(true, state, false, tiupHome))
+	})
+
+	t.Run("TagExplicit", func(t *testing.T) {
+		state := &cliState{}
+		require.False(t, shouldDestroyDataAfterExit(true, state, true, tiupHome))
 	})
 }
 
@@ -150,32 +247,59 @@ func TestRepoDownloadProgress_SetCurrent_Throttles(t *testing.T) {
 	p.SetCurrent(0)
 	require.Equal(t, base, p.lastUpdateAt)
 	require.Equal(t, int64(0), p.lastSize)
+	require.Equal(t, int64(0), p.latestSize)
 
 	now = base.Add(10 * time.Millisecond)
 	p.SetCurrent(1)
 	require.Equal(t, base, p.lastUpdateAt)
 	require.Equal(t, int64(0), p.lastSize)
+	require.Equal(t, int64(1), p.latestSize)
 
-	now = base.Add(20 * time.Millisecond)
-	p.SetCurrent(256 * 1024)
+	now = base.Add(100 * time.Millisecond)
+	p.SetCurrent(2)
 	require.Equal(t, now, p.lastUpdateAt)
-	require.Equal(t, int64(256*1024), p.lastSize)
+	require.Equal(t, int64(2), p.lastSize)
+	require.Equal(t, int64(2), p.latestSize)
 
 	lastUpdateAt := p.lastUpdateAt
 	now = lastUpdateAt.Add(10 * time.Millisecond)
-	p.SetCurrent(256*1024 + 1)
+	p.SetCurrent(3)
 	require.Equal(t, lastUpdateAt, p.lastUpdateAt)
-	require.Equal(t, int64(256*1024), p.lastSize)
+	require.Equal(t, int64(2), p.lastSize)
+	require.Equal(t, int64(3), p.latestSize)
 
-	lastUpdateAt = p.lastUpdateAt
-	now = lastUpdateAt.Add(150 * time.Millisecond)
-	p.SetCurrent(256*1024 + 2)
-	require.Equal(t, now, p.lastUpdateAt)
-	require.Equal(t, int64(256*1024+2), p.lastSize)
-
-	lastUpdateAt = p.lastUpdateAt
-	now = lastUpdateAt.Add(10 * time.Millisecond)
+	// Size decreases should always be emitted immediately (e.g. restarted download).
+	now = lastUpdateAt.Add(20 * time.Millisecond)
 	p.SetCurrent(1)
+	require.Equal(t, now, p.lastUpdateAt)
+	require.Equal(t, int64(1), p.lastSize)
+	require.Equal(t, int64(1), p.latestSize)
+}
+
+func TestRepoDownloadProgress_Finish_FlushesSuppressedCurrent(t *testing.T) {
+	g := &progressv2.Group{}
+	progress := newRepoDownloadProgress(context.Background(), g)
+
+	p, ok := progress.(*repoDownloadProgress)
+	require.True(t, ok)
+
+	p.Start("https://example.com/tidb-v7.1.0-linux-amd64.tar.gz", 0)
+
+	base := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	now := base
+	p.now = func() time.Time { return now }
+
+	p.SetCurrent(0)
+	require.Equal(t, int64(0), p.lastSize)
+	require.Equal(t, int64(0), p.latestSize)
+
+	now = base.Add(10 * time.Millisecond)
+	p.SetCurrent(1)
+	require.Equal(t, int64(0), p.lastSize)
+	require.Equal(t, int64(1), p.latestSize)
+
+	now = base.Add(20 * time.Millisecond)
+	p.Finish()
 	require.Equal(t, now, p.lastUpdateAt)
 	require.Equal(t, int64(1), p.lastSize)
 }
@@ -240,7 +364,7 @@ func TestRepoDownloadProgress_Finish_WhenCanceled_MarksCanceled(t *testing.T) {
 	ui := progressv2.New(progressv2.Options{Mode: progressv2.ModePlain, Out: f})
 	t.Cleanup(func() { _ = ui.Close() })
 
-	g := ui.Group("Downloading components")
+	g := ui.Group("Download components")
 	ctx, cancel := context.WithCancel(context.Background())
 	progress := newRepoDownloadProgress(ctx, g)
 

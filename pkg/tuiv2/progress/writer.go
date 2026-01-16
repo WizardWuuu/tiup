@@ -17,31 +17,22 @@ type uiWriter struct {
 }
 
 func (w *uiWriter) Write(p []byte) (int, error) {
-	ui := w.ui
+	ui := (*UI)(nil)
+	if w != nil {
+		ui = w.ui
+	}
 	if ui == nil {
 		return len(p), nil
 	}
-
-	ui.mu.Lock()
-	mode := ui.mode
-	out := ui.out
-	ui.mu.Unlock()
-
-	// In non-TTY modes, do not do any special handling: preserve the original
-	// byte stream.
-	if mode != ModeTTY {
-		if out == nil {
-			return len(p), nil
-		}
-		return out.Write(p)
+	if ui.closed.Load() || ui.mode == ModeOff {
+		return len(p), nil
 	}
 
-	// In TTY mode, treat output as "history lines": split by newline and append
-	// them above the Active area via Bubble Tea.
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	n := len(p)
+	var lines []string
 	for len(p) > 0 {
 		i := bytes.IndexByte(p, '\n')
 		if i < 0 {
@@ -53,30 +44,20 @@ func (w *uiWriter) Write(p []byte) (int, error) {
 		line := w.buf.String()
 		w.buf.Reset()
 		line = strings.TrimSuffix(line, "\r")
-		ui.printLogLine(line)
+		lines = append(lines, line)
 
 		p = p[i+1:]
 	}
 
+	if len(lines) > 0 {
+		ui.emit(Event{
+			Type:  EventPrintLines,
+			At:    ui.now(),
+			Lines: lines,
+		})
+	}
+
 	return n, nil
-}
-
-func (w *uiWriter) flush() {
-	ui := w.ui
-	if ui == nil {
-		return
-	}
-
-	w.mu.Lock()
-	line := w.buf.String()
-	w.buf.Reset()
-	w.mu.Unlock()
-
-	line = strings.TrimSuffix(line, "\r")
-	if line == "" {
-		return
-	}
-	ui.printLogLineForceTTY(line)
 }
 
 func (w *uiWriter) drainBufferedLine() string {
@@ -96,13 +77,12 @@ var _ io.Writer = (*uiWriter)(nil)
 var _ tuiterm.ModeProvider = (*uiWriter)(nil)
 
 func (w *uiWriter) TUIMode() tuiterm.OutputMode {
-	ui := w.ui
+	ui := (*UI)(nil)
+	if w != nil {
+		ui = w.ui
+	}
 	if ui == nil {
 		return tuiterm.OutputMode{}
 	}
-
-	ui.mu.Lock()
-	mode := ui.outMode
-	ui.mu.Unlock()
-	return mode
+	return ui.outMode
 }

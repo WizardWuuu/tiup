@@ -112,7 +112,7 @@ Key steps in `components/playground-ng/boot.go:bootCluster` (in order):
    - `bootExecutor.AddProcs(plan)`: create `proc.Process` instances from `plan.Services` and add them into controller state.
 8. Start instances: `bootStarter.startPlanned` (honor `Spec.StartAfter`, send `startProcRequest` via controller).
 9. Wait for critical ready: `bootStarter.waitRequiredReady()`.
-10. Close the “Starting instances” progress group and print Cluster info.
+10. Close the “Start instances” progress group and print Cluster info.
 11. Write `dsn` file: `dumpDSN(dataDir/dsn, ...)`.
 12. Generate Prometheus targets: `renderSDFile()` (write `prometheus-*/targets.json`).
 13. Write monitor topology into PD etcd: `updateMonitorTopology`.
@@ -130,15 +130,39 @@ Dry-run entry: `components/playground-ng/main.go` uses the same planner to produ
   - Strict JSON validation: `DisallowUnknownFields`, with a body size limit.
 
 - client (subcommands): `components/playground-ng/command.go`
-  - `display/scale-in/scale-out` first locate the target via `resolvePlaygroundTarget`, then request `/command`.
+  - `display/scale-in/scale-out/stop` first locate the target via `resolvePlaygroundTarget`, then request `/command`.
 
 Target selection rules (for multiple co-existing playground-ngs): `components/playground-ng/command.go` (`resolvePlaygroundTarget`)
 
-- If `--tag` or `TIUP_INSTANCE_DATA_DIR` is explicitly specified: read only the corresponding `dataDir/port`, no guessing.
-- Otherwise scan `<tiupHome>/data/*/port`:
-  - 0 found: report “no playground running”
-  - 1 found: use it directly
-  - multiple found: prompt that `--tag` must be specified
+- If `--tag` or `TIUP_INSTANCE_DATA_DIR` is explicitly specified: read `dataDir/port` and probe the HTTP server, no guessing.
+- Otherwise scan `<tiupHome>/data/*/port` and probe each candidate:
+  - 0 reachable: report “no playground running”
+  - 1 reachable: use it directly
+  - multiple reachable: prompt that `--tag` must be specified
+
+### 4.1 Daemon Mode (background start)
+
+- CLI: root command supports `--background/-d`, which runs a short-lived starter that spawns a daemon process of the same binary (`--run-as-daemon`).
+- Data dir selection: in daemon mode, always use `<tiupHome>/data/<tag>` (never `TIUP_INSTANCE_DATA_DIR`) so the TiUP runner won't clean it up when the starter exits.
+- Runtime markers:
+  - `dataDir/pid`: exclusive claim file to prevent concurrent startups and to detect stale instances.
+  - `dataDir/port`: created after the command server successfully listens; removed on server exit.
+  - `dataDir/daemon.log`: daemon stdout/stderr for debugging / operations.
+  - `dataDir/tuiv2.events.jsonl`: tuiv2 progress event log; starter tails + replays it to render boot progress in a real TTY.
+
+### 4.2 Progress UI (`pkg/tuiv2/progress`)
+
+Playground-ng uses a unified progress system (`tuiv2`) for both:
+
+- interactive TTY output (spinners, live-updated Active area + immutable History area)
+- non-interactive logs (CI / redirects) via a stable, append-only plain renderer
+
+Key points:
+
+- `Group` / `Task` are **emit-only handles** that can be updated from any goroutine.
+- Rendering state is exclusively owned by the UI engine loop (Bubble Tea for TTY; plain renderer otherwise), which avoids cross-goroutine state mutations.
+- `UI.Writer()` converts arbitrary `io.Writer` usage (callouts, fmt.Fprintf, log printers) into `PrintLines` events, so output never corrupts TTY rendering.
+- In daemon mode, the daemon process writes the event stream to `dataDir/tuiv2.events.jsonl`; the starter tails it and calls `UI.ReplayEvent` to reproduce the exact same output in the user’s terminal.
 
 ## 5. Scaling (scale-out / scale-in)
 
@@ -179,7 +203,10 @@ Target selection rules (for multiple co-existing playground-ngs): `components/pl
 
 **Root directory (`dataDir`)**
 
+- `dataDir/pid`: exclusive occupancy marker for a running playground.
 - `dataDir/port`: port of the HTTP control server (`dumpPort/loadPort`).
+- `dataDir/daemon.log`: daemon mode stdout/stderr log file.
+- `dataDir/tuiv2.events.jsonl`: daemon mode tuiv2 progress event log file.
 - `dataDir/dsn`: connection info written after boot completes (`dumpDSN`).
 
 **Instance directories (one per service instance)**

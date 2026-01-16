@@ -20,6 +20,7 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -89,6 +90,7 @@ const (
 	ScaleInCommandType  CommandType = "scale-in"
 	ScaleOutCommandType CommandType = "scale-out"
 	DisplayCommandType  CommandType = "display"
+	StopCommandType     CommandType = "stop"
 )
 
 // DisplayRequest is the request payload for the "display" command.
@@ -134,10 +136,19 @@ type CommandReply struct {
 type cliState struct {
 	options BootOptions
 
-	tag            string
-	tiupDataDir    string
-	dataDir        string
-	deleteWhenExit bool
+	tag         string
+	tiupDataDir string
+	dataDir     string
+	// destroyDataAfterExit controls user-facing hints, and (when not managed by
+	// the TiUP runner) whether playground-ng should remove the instance data
+	// directory on exit.
+	//
+	// When running under the TiUP runner, TIUP_INSTANCE_DATA_DIR is managed by the
+	// runner; keep this flag for hints only.
+	destroyDataAfterExit bool
+
+	background  bool
+	runAsDaemon bool
 
 	dryRun       bool
 	dryRunOutput string
@@ -159,11 +170,29 @@ func resolvePlaygroundTarget(explicitTag, tiupDataDir, dataDir string) (playgrou
 			}
 			return playgroundTarget{}, playgroundNotRunningError{err: errors.Annotatef(err, "no playground running for tag %q", tag)}
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		ok, probeErr := probePlaygroundCommandServer(ctx, port)
+		if ok && probeErr == nil {
+			tag := explicitTag
+			if tag == "" {
+				tag = filepath.Base(dataDir)
+			}
+			return playgroundTarget{tag: tag, dir: dataDir, port: port}, nil
+		}
+
 		tag := explicitTag
 		if tag == "" {
 			tag = filepath.Base(dataDir)
 		}
-		return playgroundTarget{tag: tag, dir: dataDir, port: port}, nil
+		switch {
+		case isTimeoutErr(probeErr):
+			return playgroundTarget{}, playgroundUnreachableError{err: errors.Annotatef(probeErr, "probe playground %q command server timed out (port=%d)", tag, port)}
+		case stdErrors.Is(probeErr, syscall.ECONNREFUSED):
+			return playgroundTarget{}, playgroundNotRunningError{err: errors.Errorf("no playground running for tag %q", tag)}
+		default:
+			return playgroundTarget{}, playgroundUnreachableError{err: errors.Annotatef(probeErr, "probe playground %q command server (port=%d)", tag, port)}
+		}
 	}
 
 	baseDir := dataDir
@@ -200,6 +229,9 @@ type playgroundTarget struct {
 func listPlaygroundTargets(baseDir string) ([]playgroundTarget, error) {
 	entries, err := os.ReadDir(baseDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, errors.AddStack(err)
 	}
 
@@ -213,7 +245,14 @@ func listPlaygroundTargets(baseDir string) ([]playgroundTarget, error) {
 		if err != nil || port <= 0 {
 			continue
 		}
-		out = append(out, playgroundTarget{tag: ent.Name(), dir: dir, port: port})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		ok, probeErr := probePlaygroundCommandServer(ctx, port)
+		cancel()
+		if ok && probeErr == nil {
+			out = append(out, playgroundTarget{tag: ent.Name(), dir: dir, port: port})
+			continue
+		}
 	}
 
 	slices.SortStableFunc(out, func(a, b playgroundTarget) int {
@@ -391,13 +430,31 @@ func newDisplay(state *cliState) *cobra.Command {
 				return err
 			}
 			if !verbose && !jsonOut {
-				colorstr.Fprintf(tuiv2output.Stderr.Get(), "\n[dark_gray]Tip: use --verbose to show more columns: COMPONENT, PID, VERSION, BINARY, LOG[reset]\n")
+				colorstr.Fprintf(tuiv2output.Stderr.Get(), "\n[dim]Tip: use --verbose to show more columns: COMPONENT, PID, VERSION, BINARY, LOG[reset]\n")
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Show more details for each instance")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output in JSON format")
+	return cmd
+}
+
+func newStop(state *cliState) *cobra.Command {
+	var timeoutSec int
+	cmd := &cobra.Command{
+		Use:     "stop",
+		Short:   "Stop a running playground",
+		Example: "tiup playground-ng stop --tag my-cluster",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if timeoutSec <= 0 {
+				timeoutSec = 60
+			}
+			return stop(cmd.OutOrStdout(), time.Duration(timeoutSec)*time.Second, state)
+		},
+		Hidden: false,
+	}
+	cmd.Flags().IntVar(&timeoutSec, "timeout", 60, "Max wait time in seconds for stopping")
 	return cmd
 }
 
@@ -473,6 +530,33 @@ func display(out io.Writer, verbose, jsonOut bool, state *cliState) error {
 		printDisplayFailureWarning(out, err)
 		return renderedError{err: err}
 	}
+	return nil
+}
+
+func stop(out io.Writer, timeout time.Duration, state *cliState) error {
+	target, err := resolvePlaygroundTarget(state.tag, state.tiupDataDir, state.dataDir)
+	if err != nil {
+		printDisplayFailureWarning(out, err)
+		return renderedError{err: err}
+	}
+
+	addr := "127.0.0.1:" + strconv.Itoa(target.port)
+	if err := sendCommandsAndPrintResult(out, []Command{{Type: StopCommandType}}, addr); err != nil {
+		printDisplayFailureWarning(out, err)
+		return renderedError{err: err}
+	}
+
+	if err := waitPlaygroundStopped(target.dir, timeout); err != nil {
+		if out == nil {
+			out = io.Discard
+		}
+		fmt.Fprint(out, tuiv2output.Callout{
+			Style:   tuiv2output.CalloutFailed,
+			Content: fmt.Sprintf("Stop playground %q timed out: %v", target.tag, err),
+		}.Render(out))
+		return renderedError{err: err}
+	}
+
 	return nil
 }
 
@@ -559,7 +643,19 @@ func sendCommandsAndPrintResult(out io.Writer, cmds []Command, addr string) erro
 }
 
 func (p *Playground) listenAndServeHTTP() error {
+	// In daemon/starter mode, the starter uses the HTTP command server as the
+	// readiness signal. Make sure all pending progress/output events are flushed
+	// (including the final "cluster info" callout) before exposing readiness via
+	// the port file / listening socket.
+	if p != nil && p.ui != nil {
+		p.ui.Sync()
+	}
+
 	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommandReply{OK: true, Message: "pong"})
+	})
 	mux.HandleFunc("/command", p.commandHandler)
 
 	srv := &http.Server{
@@ -579,7 +675,20 @@ func (p *Playground) listenAndServeHTTP() error {
 		_ = srv.Close()
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	if p != nil && p.dataDir != "" {
+		portPath := filepath.Join(p.dataDir, playgroundPortFileName)
+		if err := dumpPort(portPath, p.port); err != nil {
+			_ = ln.Close()
+			return err
+		}
+		defer func() { _ = os.Remove(portPath) }()
+	}
+
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
@@ -615,6 +724,23 @@ func (p *Playground) commandHandler(w http.ResponseWriter, r *http.Request) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(CommandReply{OK: false, Error: "invalid JSON payload"})
+		return
+	}
+
+	if cmd.Type == StopCommandType {
+		reply := CommandReply{OK: true, Message: "Stopping playground...\n"}
+		if p != nil && p.Stopping() {
+			reply.Message = "Playground is already stopping...\n"
+		}
+		_ = json.NewEncoder(w).Encode(&reply)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go func() {
+			if p != nil {
+				p.requestStopInternal()
+			}
+		}()
 		return
 	}
 
