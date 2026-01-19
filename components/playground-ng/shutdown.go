@@ -105,7 +105,10 @@ func (p *Playground) forceKillShutdownWithControllerState(state *controllerState
 		shutdownGroup.SetTitle("Shutdown (force killed)")
 	}
 
-	go p.terminateForceKill(p.shutdownProcRecords)
+	// Force kill is expected to take effect immediately (e.g. double Ctrl+C).
+	// Do it synchronously so we don't accidentally wait for graceful SIGTERM
+	// completion just because the scheduler hasn't run the kill goroutine yet.
+	p.terminateForceKill(p.shutdownProcRecords)
 }
 
 func (p *Playground) addWaitProc(inst proc.Process) chan error {
@@ -324,7 +327,7 @@ func (p *Playground) terminateGracefully(records []procRecordSnapshot) {
 			task.Start()
 		}
 
-		_ = syscall.Kill(t.pid, syscall.SIGTERM)
+		_ = killProcessOrGroup(t.pid, syscall.SIGTERM)
 	}
 
 	var wg sync.WaitGroup
@@ -334,7 +337,7 @@ func (p *Playground) terminateGracefully(records []procRecordSnapshot) {
 			defer wg.Done()
 
 			timer := time.AfterFunc(forceKillAfterDuration, func() {
-				_ = syscall.Kill(t.pid, syscall.SIGKILL)
+				_ = killProcessOrGroup(t.pid, syscall.SIGKILL)
 			})
 			// On shutdown, process may exit with non-zero due to the signal.
 			// Consider it a successful shutdown once it quits.
@@ -377,7 +380,7 @@ func (p *Playground) terminateForceKill(records []procRecordSnapshot) {
 		if pid <= 0 {
 			continue
 		}
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		_ = killProcessOrGroup(pid, syscall.SIGKILL)
 	}
 }
 
