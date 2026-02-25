@@ -127,6 +127,48 @@ func TestFoldMap(t *testing.T) {
 	}, r)
 }
 
+func TestYAMLFloatSerialization(t *testing.T) {
+	// Test that float values are serialized with decimal point preserved.
+	// This ensures the forked yaml.v3 correctly handles float serialization.
+	// See: https://github.com/go-yaml/yaml/issues/1038
+	yamlData := []byte(`
+server_configs:
+  tidb:
+    float_one: 1.0
+    float_zero: 0.0
+    float_value: 3.14
+`)
+
+	topo := new(Specification)
+	err := yaml.Unmarshal(yamlData, topo)
+	require.NoError(t, err)
+
+	// Verify the values are correctly parsed as float64
+	require.Equal(t, float64(1.0), topo.ServerConfigs.TiDB["float_one"])
+	require.Equal(t, float64(0.0), topo.ServerConfigs.TiDB["float_zero"])
+	require.Equal(t, float64(3.14), topo.ServerConfigs.TiDB["float_value"])
+
+	// Marshal back to YAML
+	marshaled, err := yaml.Marshal(topo)
+	require.NoError(t, err)
+
+	// The forked yaml.v3 should serialize float 1.0 as "1.0" (not "1")
+	// This preserves the float type during round-trip serialization
+	require.Contains(t, string(marshaled), "1.0")
+	require.Contains(t, string(marshaled), "0.0")
+	require.Contains(t, string(marshaled), "3.14")
+
+	// Unmarshal again to verify type is preserved
+	topo2 := new(Specification)
+	err = yaml.Unmarshal(marshaled, topo2)
+	require.NoError(t, err)
+
+	// After round-trip, the values should still be float64
+	require.IsType(t, float64(0), topo2.ServerConfigs.TiDB["float_one"])
+	require.IsType(t, float64(0), topo2.ServerConfigs.TiDB["float_zero"])
+	require.IsType(t, float64(0), topo2.ServerConfigs.TiDB["float_value"])
+}
+
 func TestEncodeRemoteCfg(t *testing.T) {
 	yamlData := []byte(`remote_write:
     - queue_config:
