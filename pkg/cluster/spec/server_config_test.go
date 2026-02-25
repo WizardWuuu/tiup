@@ -1,7 +1,6 @@
 package spec
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,6 +12,8 @@ func TestMerge(t *testing.T) {
 server_configs:
   tidb:
     performance.feedback-probability: 12.0
+    log.level: 0.0
+    token-limit: 1000.1
 `)
 
 	topo := new(Specification)
@@ -20,16 +21,22 @@ server_configs:
 	err := yaml.Unmarshal(yamlData, topo)
 	require.NoError(t, err)
 
-	yamlData, err = yaml.Marshal(topo)
+	// Verify values are parsed as float64
+	require.Equal(t, float64(12.0), topo.ServerConfigs.TiDB["performance.feedback-probability"])
+	require.Equal(t, float64(0.0), topo.ServerConfigs.TiDB["log.level"])
+	require.Equal(t, float64(1000.1), topo.ServerConfigs.TiDB["token-limit"])
+
+	// Verify Marshal/Unmarshal round-trip works without error
+	_, err = yaml.Marshal(topo)
 	require.NoError(t, err)
-	decimal := bytes.Contains(yamlData, []byte("12"))
-	require.True(t, decimal)
 
 	get, err := Merge2Toml("tidb", topo.ServerConfigs.TiDB, nil)
 	require.NoError(t, err)
 
-	decimal = bytes.Contains(get, []byte("12.0"))
-	require.True(t, decimal)
+	// Verify all float values retain decimal point in TOML output
+	require.Contains(t, string(get), "12.0")
+	require.Contains(t, string(get), "0.0")
+	require.Contains(t, string(get), "1000.1")
 }
 
 func TestGetValueFromPath(t *testing.T) {
